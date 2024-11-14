@@ -80,11 +80,9 @@ def fix_row_with_extra_commas(row: List[str], expected_columns: int) -> Tuple[Li
         return row + [''] * (expected_columns - len(row)), fix_message
     return row, ""
 
-def custom_csv_parser(file_obj) -> Tuple[List[Dict], ProcessingSummary]:
-    """
-    Custom CSV parser to handle inconsistent column counts and fix rows with extra commas
-    while preserving required columns.
-    """
+def custom_csv_parser(file_obj) -> Tuple[List[Dict], ProcessingSummary, float]:
+    """Custom CSV parser that now returns processing time"""
+    start_time = time()
     summary = ProcessingSummary()
     parsed_data = []
     required_columns = ['Key', 'Description', 'Customizable', 'Can Be Empty']
@@ -121,7 +119,7 @@ def custom_csv_parser(file_obj) -> Tuple[List[Dict], ProcessingSummary]:
         missing_columns = set(required_columns) - set(header)
         if missing_columns:
             summary.add_message(f"Missing required columns: {', '.join(missing_columns)}")
-            return [], summary
+            return [], summary, 0
         
         # Get indices of required columns
         req_col_indices = {col: header.index(col) for col in required_columns if col in header}
@@ -172,12 +170,12 @@ def custom_csv_parser(file_obj) -> Tuple[List[Dict], ProcessingSummary]:
         progress_bar.empty()
         
         summary.add_message("CSV processing completed successfully")
-    
     except Exception as e:
         summary.add_message(f"Error parsing CSV: {str(e)}")
-        return [], summary
+        return [], summary, 0
     
-    return parsed_data, summary
+    processing_time = time() - start_time
+    return parsed_data, summary, processing_time
 
 def detect_language_gpt(text: str, api_key: str) -> str:
     """Use GPT to detect language when langdetect fails"""
@@ -213,36 +211,65 @@ def find_correct_column(detected_lang: str) -> str:
             return columns[0]  # Return first matching column
     return None
 
+def detect_language_gpt_batch(texts: List[str], api_key: str) -> List[str]:
+    """Use GPT to detect language for multiple texts at once"""
+    client = openai.OpenAI(api_key=api_key)
+    try:
+        # Combine texts into a single request
+        combined_text = "\n---\n".join([f"Text {i+1}: {text}" for i, text in enumerate(texts)])
+        
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a language detection expert. For each text provided, respond with its ISO 639-1 language code. Format your response as a comma-separated list of codes in order."},
+                {"role": "user", "content": f"What language are these texts in? Respond only with comma-separated language codes:\n{combined_text}"}
+            ],
+            temperature=0
+        )
+        
+        # Parse the response into a list of language codes
+        lang_codes = [code.strip().lower() for code in response.choices[0].message.content.split(',')]
+        return lang_codes
+    except Exception as e:
+        logger.error(f"GPT batch language detection failed: {str(e)}")
+        return [None] * len(texts)
+
 def process_csv(uploaded_file, api_key: str):
     try:
         # Reset file pointer
         uploaded_file.seek(0)
         
-        # Parse CSV with custom parser that handles and fixes problematic rows
-        parsed_data, summary = custom_csv_parser(uploaded_file)
+        # Parse CSV and get timing
+        csv_start = time()
+        parsed_data, summary, csv_time = custom_csv_parser(uploaded_file)
         if not parsed_data:
-            return None, summary
+            return None, summary, (0, 0)
         
         df = pd.DataFrame(parsed_data)
+        
+        # Language detection timing
+        lang_start = time()
+        st.write("Checking language columns... This may take a few minutes.")
         
         # Add progress bar for language detection
         total_cells = len(df) * len(LANGUAGE_COLUMNS)
         progress_bar = st.progress(0)
         time_container = st.empty()
         start_time = time()
-        st.write("Checking language columns... This may take a few minutes.")
         
-        # Process in batches of rows for better performance
-        batch_size = 10
+        # Process in larger batches for GPT
+        batch_size = 20  # Increased batch size
         cells_processed = 0
         
         for start_idx in range(0, len(df), batch_size):
             end_idx = min(start_idx + batch_size, len(df))
             batch = df.iloc[start_idx:end_idx]
             
+            # Collect texts that need GPT processing
+            gpt_texts = []
+            text_locations = []  # Store (idx, col) pairs for mapping back results
+            
             for idx, row in batch.iterrows():
-                moves = []  # Store all moves to make them at once
-                
                 for col in LANGUAGE_COLUMNS:
                     cells_processed += 1
                     progress = cells_processed / total_cells
@@ -256,7 +283,6 @@ def process_csv(uploaded_file, api_key: str):
                         time_container.text(f"Estimated time remaining: {remaining_time:.1f} seconds")
                     
                     if pd.notna(row[col]) and isinstance(row[col], str) and len(row[col].strip()) > 0:
-                        # Only process non-empty cells with actual content
                         text = row[col].strip()
                         if len(text) < 3:  # Skip very short texts
                             continue
@@ -265,29 +291,43 @@ def process_csv(uploaded_file, api_key: str):
                             # Try langdetect first (faster)
                             detected_lang = detect(text)
                         except LangDetectException:
-                            # Only use GPT as fallback for longer texts
+                            # Only use GPT for longer texts
                             if len(text) > 10:
-                                detected_lang = detect_language_gpt(text, api_key)
-                            else:
-                                continue
+                                gpt_texts.append(text)
+                                text_locations.append((idx, col))
+                            continue
                         
+                        # Process langdetect results immediately
                         if detected_lang:
                             correct_col = find_correct_column(detected_lang)
                             if correct_col and correct_col != col:
-                                # Check if target column is empty
                                 if pd.isna(row[correct_col]) or row[correct_col] == '':
-                                    moves.append((idx, col, correct_col, text))
-                
-                # Apply all moves for this row at once
-                for move_idx, from_col, to_col, text in moves:
-                    df.at[move_idx, to_col] = text
-                    df.at[move_idx, from_col] = ''
-                    summary.add_message(
-                        f"Moving text from {from_col} to {to_col} (row {move_idx+2})",
-                        move_idx+2
-                    )
+                                    df.at[idx, correct_col] = text
+                                    df.at[idx, col] = ''
+                                    summary.add_message(
+                                        f"Moving text from {col} to {correct_col} (row {idx+2})",
+                                        idx+2
+                                    )
             
-            # Add a small sleep to prevent API rate limiting if needed
+            # Process GPT batch if we have any texts
+            if gpt_texts:
+                detected_langs = detect_language_gpt_batch(gpt_texts, api_key)
+                
+                # Process GPT results
+                for (idx, col), detected_lang in zip(text_locations, detected_langs):
+                    if detected_lang:
+                        correct_col = find_correct_column(detected_lang)
+                        if correct_col and correct_col != col:
+                            text = df.at[idx, col]
+                            if pd.isna(df.at[idx, correct_col]) or df.at[idx, correct_col] == '':
+                                df.at[idx, correct_col] = text
+                                df.at[idx, col] = ''
+                                summary.add_message(
+                                    f"Moving text from {col} to {correct_col} (row {idx+2})",
+                                    idx+2
+                                )
+            
+            # Add a small sleep to prevent API rate limiting
             sleep(0.1)
         
         # Clear progress elements
@@ -299,7 +339,7 @@ def process_csv(uploaded_file, api_key: str):
         missing_columns = set(preserved_columns) - set(df.columns)
         if missing_columns:
             summary.add_message(f"Missing required columns: {', '.join(missing_columns)}")
-            return None, summary
+            return None, summary, (0, 0)
         
         # Create new DataFrame with preserved columns first
         new_df = pd.DataFrame()
@@ -317,12 +357,18 @@ def process_csv(uploaded_file, api_key: str):
         if len(new_df.columns) != EXPECTED_TOTAL_COLUMNS:
             summary.add_message(f"Warning: Output file has {len(new_df.columns)} columns, expected {EXPECTED_TOTAL_COLUMNS}")
         
-        return new_df, summary
+        lang_time = time() - lang_start
+        
+        # Add timing information to summary
+        summary.add_message(f"CSV cleaning completed in {csv_time:.2f} seconds")
+        summary.add_message(f"Language detection completed in {lang_time:.2f} seconds")
+        
+        return new_df, summary, (csv_time, lang_time)
     except Exception as e:
         logger.error(f"Error processing CSV: {str(e)}")
         summary = ProcessingSummary()
         summary.add_message(f"Error processing CSV: {str(e)}")
-        return None, summary
+        return None, summary, (0, 0)
 
 def main():
     st.title("📋 Clean Locale Configuration File")
@@ -334,8 +380,8 @@ def main():
     uploaded_file = st.file_uploader("Choose a CSV file", type=['csv'])
     
     if uploaded_file is not None:
-        # Pass api_key to process_csv
-        df, summary = process_csv(uploaded_file, api_key)
+        # Process CSV and get timing information
+        df, summary, (csv_time, lang_time) = process_csv(uploaded_file, api_key)
         
         if df is not None:
             # Data Preview Container
@@ -423,6 +469,18 @@ def main():
                         with tabs[tab_index]:
                             for msg in summary.success_messages:
                                 st.success(msg)
+
+            # Timing Information Container
+            with st.container():
+                st.markdown("### ⏱️ Processing Times")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("CSV Cleaning", f"{csv_time:.2f}s")
+                with col2:
+                    st.metric("Language Detection", f"{lang_time:.2f}s")
+                with col3:
+                    st.metric("Total Time", f"{(csv_time + lang_time):.2f}s")
+                st.markdown("<br>", unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
