@@ -182,7 +182,7 @@ def detect_language_gpt(text: str, api_key: str) -> str:
     client = openai.OpenAI(api_key=api_key)
     try:
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a language detection expert. Respond only with the ISO 639-1 language code."},
                 {"role": "user", "content": f"What language is this text in? Respond only with the language code: {text}"}
