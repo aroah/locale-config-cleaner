@@ -264,46 +264,69 @@ def process_csv(uploaded_file, api_key: str):
         cells_processed = 0
         
         try:
-        for start_idx in range(0, len(df), batch_size):
-            end_idx = min(start_idx + batch_size, len(df))
-            batch = df.iloc[start_idx:end_idx]
-            
-            # Collect texts that need GPT processing
-            gpt_texts = []
-            text_locations = []  # Store (idx, col) pairs for mapping back results
-            
-            for idx, row in batch.iterrows():
-                for col in LANGUAGE_COLUMNS:
-                    cells_processed += 1
-                    progress = cells_processed / total_cells
-                    progress_bar.progress(progress)
-                    
-                    # Calculate time remaining
-                    elapsed_time = time() - start_time
-                    if progress > 0:
-                        estimated_total = elapsed_time / progress
-                        remaining_time = estimated_total - elapsed_time
-                        time_container.text(f"Estimated time remaining: {remaining_time:.1f} seconds")
-                    
-                    if pd.notna(row[col]) and isinstance(row[col], str) and len(row[col].strip()) > 0:
-                        text = row[col].strip()
-                        if len(text) < 3:  # Skip very short texts
-                            continue
-                            
-                        try:
-                            # Try langdetect first (faster)
-                            detected_lang = detect(text)
-                        except LangDetectException:
-                            # Only use GPT for longer texts
-                            if len(text) > 10:
-                                gpt_texts.append(text)
-                                text_locations.append((idx, col))
-                            continue
+            for start_idx in range(0, len(df), batch_size):
+                end_idx = min(start_idx + batch_size, len(df))
+                batch = df.iloc[start_idx:end_idx]
+                
+                # Collect texts that need GPT processing
+                gpt_texts = []
+                text_locations = []  # Store (idx, col) pairs for mapping back results
+                
+                for idx, row in batch.iterrows():
+                    for col in LANGUAGE_COLUMNS:
+                        cells_processed += 1
+                        progress = cells_processed / total_cells
+                        progress_bar.progress(progress)
                         
-                        # Process langdetect results immediately
+                        # Calculate time remaining
+                        elapsed_time = time() - start_time
+                        if progress > 0:
+                            estimated_total = elapsed_time / progress
+                            remaining_time = estimated_total - elapsed_time
+                            time_container.text(f"Estimated time remaining: {remaining_time:.1f} seconds")
+                        
+                        if pd.notna(row[col]) and isinstance(row[col], str) and len(row[col].strip()) > 0:
+                            text = row[col].strip()
+                            if len(text) < 3:  # Skip very short texts
+                                continue
+                            
+                            try:
+                                # Try langdetect first (faster)
+                                detected_lang = detect(text)
+                            except LangDetectException:
+                                # Only use GPT for longer texts
+                                if len(text) > 10:
+                                    gpt_texts.append(text)
+                                    text_locations.append((idx, col))
+                                continue
+                            
+                            # Process langdetect results immediately
+                            if detected_lang:
+                                correct_col = find_correct_column(detected_lang)
+                                if correct_col and correct_col != col:
+                                    if pd.isna(df.at[idx, correct_col]) or df.at[idx, correct_col] == '':
+                                        df.at[idx, correct_col] = text
+                                        df.at[idx, col] = ''
+                                        summary.add_message(
+                                            f"Moving text from {col} to {correct_col} (row {idx+2})",
+                                            idx+2
+                                        )
+                                    else:
+                                        summary.add_message(
+                                            f"Could not move text from {col} to {correct_col} (row {idx+2}) - target column already contains content",
+                                            idx+2
+                                        )
+                
+                # Process GPT batch if we have any texts
+                if gpt_texts:
+                    detected_langs = detect_language_gpt_batch(gpt_texts, api_key)
+                    
+                    # Process GPT results
+                    for (idx, col), detected_lang in zip(text_locations, detected_langs):
                         if detected_lang:
                             correct_col = find_correct_column(detected_lang)
                             if correct_col and correct_col != col:
+                                text = df.at[idx, col]
                                 if pd.isna(df.at[idx, correct_col]) or df.at[idx, correct_col] == '':
                                     df.at[idx, correct_col] = text
                                     df.at[idx, col] = ''
@@ -311,67 +334,44 @@ def process_csv(uploaded_file, api_key: str):
                                         f"Moving text from {col} to {correct_col} (row {idx+2})",
                                         idx+2
                                     )
-                                else:
-                                    summary.add_message(
-                                        f"Could not move text from {col} to {correct_col} (row {idx+2}) - target column already contains content",
-                                        idx+2
-                                    )
-            
-            # Process GPT batch if we have any texts
-            if gpt_texts:
-                detected_langs = detect_language_gpt_batch(gpt_texts, api_key)
                 
-                # Process GPT results
-                for (idx, col), detected_lang in zip(text_locations, detected_langs):
-                    if detected_lang:
-                        correct_col = find_correct_column(detected_lang)
-                        if correct_col and correct_col != col:
-                            text = df.at[idx, col]
-                            if pd.isna(df.at[idx, correct_col]) or df.at[idx, correct_col] == '':
-                                df.at[idx, correct_col] = text
-                                df.at[idx, col] = ''
-                                summary.add_message(
-                                    f"Moving text from {col} to {correct_col} (row {idx+2})",
-                                    idx+2
-                                )
+                # Add a small sleep to prevent API rate limiting
+                sleep(0.1)
             
-            # Add a small sleep to prevent API rate limiting
-            sleep(0.1)
-        
             # Ensure progress elements are always cleared
             progress_placeholder.empty()
-        time_container.empty()
-        
-        # Ensure required columns are present and preserved
-        preserved_columns = ['Key', 'Description', 'Customizable', 'Can Be Empty']
-        missing_columns = set(preserved_columns) - set(df.columns)
-        if missing_columns:
-            summary.add_message(f"Missing required columns: {', '.join(missing_columns)}")
-            return None, summary, (0, 0)
-        
-        # Create new DataFrame with preserved columns first
-        new_df = pd.DataFrame()
-        
-        # Add preserved columns first
-        for col in preserved_columns:
-            if col in df.columns:
-                new_df[col] = df[col]
-        
-        # Add remaining columns
-        remaining_cols = [col for col in df.columns if col not in preserved_columns]
-        new_df = pd.concat([new_df, df[remaining_cols]], axis=1)
-        
-        # Validate total number of columns
-        if len(new_df.columns) != EXPECTED_TOTAL_COLUMNS:
-            summary.add_message(f"Warning: Output file has {len(new_df.columns)} columns, expected {EXPECTED_TOTAL_COLUMNS}")
-        
-        lang_time = time() - lang_start
-        
-        # Add timing information to summary
-        summary.add_message(f"CSV cleaning completed in {csv_time:.2f} seconds")
-        summary.add_message(f"Language detection completed in {lang_time:.2f} seconds")
-        
-        return new_df, summary, (csv_time, lang_time)
+            time_container.empty()
+            
+            # Ensure required columns are present and preserved
+            preserved_columns = ['Key', 'Description', 'Customizable', 'Can Be Empty']
+            missing_columns = set(preserved_columns) - set(df.columns)
+            if missing_columns:
+                summary.add_message(f"Missing required columns: {', '.join(missing_columns)}")
+                return None, summary, (0, 0)
+            
+            # Create new DataFrame with preserved columns first
+            new_df = pd.DataFrame()
+            
+            # Add preserved columns first
+            for col in preserved_columns:
+                if col in df.columns:
+                    new_df[col] = df[col]
+            
+            # Add remaining columns
+            remaining_cols = [col for col in df.columns if col not in preserved_columns]
+            new_df = pd.concat([new_df, df[remaining_cols]], axis=1)
+            
+            # Validate total number of columns
+            if len(new_df.columns) != EXPECTED_TOTAL_COLUMNS:
+                summary.add_message(f"Warning: Output file has {len(new_df.columns)} columns, expected {EXPECTED_TOTAL_COLUMNS}")
+            
+            lang_time = time() - lang_start
+            
+            # Add timing information to summary
+            summary.add_message(f"CSV cleaning completed in {csv_time:.2f} seconds")
+            summary.add_message(f"Language detection completed in {lang_time:.2f} seconds")
+            
+            return new_df, summary, (csv_time, lang_time)
         finally:
             # Ensure progress elements are always cleared
             progress_placeholder.empty()
