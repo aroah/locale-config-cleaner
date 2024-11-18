@@ -124,8 +124,9 @@ def custom_csv_parser(file_obj) -> Tuple[List[Dict], ProcessingSummary, float]:
         # Get indices of required columns
         req_col_indices = {col: header.index(col) for col in required_columns if col in header}
         
-        # Initialize progress bar
-        progress_bar = st.progress(0)
+        # Initialize progress bar in a placeholder
+        progress_placeholder = st.empty()
+        progress_bar = progress_placeholder.progress(0)
         
         # Process each row
         for line_num, row in enumerate(reader, start=2):
@@ -167,7 +168,7 @@ def custom_csv_parser(file_obj) -> Tuple[List[Dict], ProcessingSummary, float]:
         # Complete progress bar
         progress_bar.progress(1.0)
         # Remove progress bar
-        progress_bar.empty()
+        progress_placeholder.empty()
         
         summary.add_message("CSV processing completed successfully")
     except Exception as e:
@@ -253,14 +254,16 @@ def process_csv(uploaded_file, api_key: str):
         
         # Add progress bar for language detection
         total_cells = len(df) * len(LANGUAGE_COLUMNS)
-        progress_bar = st.progress(0)
+        progress_placeholder = st.empty()
+        progress_bar = progress_placeholder.progress(0)
         time_container = st.empty()
         start_time = time()
         
         # Process in larger batches for GPT
-        batch_size = 20  # Increased batch size
+        batch_size = 20
         cells_processed = 0
         
+        try:
         for start_idx in range(0, len(df), batch_size):
             end_idx = min(start_idx + batch_size, len(df))
             batch = df.iloc[start_idx:end_idx]
@@ -335,8 +338,8 @@ def process_csv(uploaded_file, api_key: str):
             # Add a small sleep to prevent API rate limiting
             sleep(0.1)
         
-        # Clear progress elements
-        progress_bar.empty()
+            # Ensure progress elements are always cleared
+            progress_placeholder.empty()
         time_container.empty()
         
         # Ensure required columns are present and preserved
@@ -369,6 +372,10 @@ def process_csv(uploaded_file, api_key: str):
         summary.add_message(f"Language detection completed in {lang_time:.2f} seconds")
         
         return new_df, summary, (csv_time, lang_time)
+        finally:
+            # Ensure progress elements are always cleared
+            progress_placeholder.empty()
+            time_container.empty()
     except Exception as e:
         logger.error(f"Error processing CSV: {str(e)}")
         summary = ProcessingSummary()
