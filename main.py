@@ -301,11 +301,16 @@ def process_csv(uploaded_file, api_key: str):
                         if detected_lang:
                             correct_col = find_correct_column(detected_lang)
                             if correct_col and correct_col != col:
-                                if pd.isna(row[correct_col]) or row[correct_col] == '':
+                                if pd.isna(df.at[idx, correct_col]) or df.at[idx, correct_col] == '':
                                     df.at[idx, correct_col] = text
                                     df.at[idx, col] = ''
                                     summary.add_message(
                                         f"Moving text from {col} to {correct_col} (row {idx+2})",
+                                        idx+2
+                                    )
+                                else:
+                                    summary.add_message(
+                                        f"Could not move text from {col} to {correct_col} (row {idx+2}) - target column already contains content",
                                         idx+2
                                     )
             
